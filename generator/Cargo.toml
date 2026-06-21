@@ -1,0 +1,10 @@
+[package]
+name = "polytech-latex-generator"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive generator for the Polytech LaTeX template"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"

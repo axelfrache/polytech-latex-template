@@ -1,0 +1,16 @@
+/image.png
+/plan.md
+/.claude/
+/rapport.aux
+/rapport.bbl
+/rapport.bcf
+/rapport.blg
+/rapport.fdb_latexmk
+/rapport.fls
+/rapport.log
+/rapport.out
+/rapport.pdf
+/rapport.run.xml
+/rapport.synctex.gz
+/rapport.toc
+sections/*.aux

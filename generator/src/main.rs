@@ -21,7 +21,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -57,15 +57,134 @@ const REPORT_TYPE: usize = 2;
 const AUTHOR: usize = 3;
 const PROGRAM: usize = 4;
 const ACADEMIC_YEAR: usize = 5;
-const DESTINATION: usize = 6;
-const GIT_REMOTE: usize = 7;
-const INITIAL_COMMIT: usize = 8;
+const PARENT_DIRECTORY: usize = 6;
+const FOLDER_NAME: usize = 7;
+const GIT_REMOTE: usize = 8;
+const INITIAL_COMMIT: usize = 9;
 
 #[derive(Debug)]
 struct Field {
     label: &'static str,
     value: String,
     placeholder: &'static str,
+}
+
+#[derive(Clone, Debug)]
+enum PickerEntry {
+    SelectCurrent,
+    Parent(PathBuf),
+    Directory(PathBuf),
+}
+
+impl PickerEntry {
+    fn label(&self) -> String {
+        match self {
+            Self::SelectCurrent => "[ Select this directory ]".into(),
+            Self::Parent(_) => "../".into(),
+            Self::Directory(path) => format!(
+                "{}/",
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into()
+                )
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DirectoryPicker {
+    current: PathBuf,
+    entries: Vec<PickerEntry>,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl DirectoryPicker {
+    fn new(path: &Path) -> AppResult<Self> {
+        if !path.is_dir() {
+            return Err(input_error(format!(
+                "Parent directory does not exist: {}",
+                path.display()
+            )));
+        }
+
+        let mut picker = Self {
+            current: fs::canonicalize(path)?,
+            entries: Vec::new(),
+            selected: 0,
+            error: None,
+        };
+        picker.refresh();
+        Ok(picker)
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.entries.push(PickerEntry::SelectCurrent);
+        if let Some(parent) = self.current.parent() {
+            self.entries.push(PickerEntry::Parent(parent.to_path_buf()));
+        }
+
+        match fs::read_dir(&self.current) {
+            Ok(entries) => {
+                let mut directories: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect();
+                directories.sort_by_key(|path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                });
+                self.entries
+                    .extend(directories.into_iter().map(PickerEntry::Directory));
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1));
+    }
+
+    fn enter_selected(&mut self) -> Option<PathBuf> {
+        match self.entries.get(self.selected).cloned() {
+            Some(PickerEntry::SelectCurrent) => Some(self.current.clone()),
+            Some(PickerEntry::Parent(path) | PickerEntry::Directory(path)) => {
+                self.open(path);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn go_to_parent(&mut self) {
+        if let Some(parent) = self.current.parent().map(Path::to_path_buf) {
+            self.open(parent);
+        }
+    }
+
+    fn open(&mut self, path: PathBuf) {
+        match fs::canonicalize(&path) {
+            Ok(path) if path.is_dir() => {
+                self.current = path;
+                self.selected = 0;
+                self.refresh();
+            }
+            Ok(_) => self.error = Some(format!("Not a directory: {}", path.display())),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -80,7 +199,8 @@ struct App {
     cursors: Vec<usize>,
     active: usize,
     create_initial_commit: bool,
-    destination_follows_name: bool,
+    folder_follows_name: bool,
+    directory_picker: Option<DirectoryPicker>,
     status: Option<(String, bool)>,
     outcome: Option<GenerationOutcome>,
     quit: bool,
@@ -88,6 +208,7 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let current_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let fields = vec![
             Field {
                 label: "Repository name",
@@ -120,9 +241,14 @@ impl App {
                 placeholder: "2026--2027",
             },
             Field {
-                label: "Destination",
-                value: "./my-latex-project".into(),
-                placeholder: "./my-latex-project",
+                label: "Parent directory",
+                value: current_directory.display().to_string(),
+                placeholder: ".",
+            },
+            Field {
+                label: "Folder name",
+                value: "my-latex-project".into(),
+                placeholder: "my-latex-project",
             },
             Field {
                 label: "Git remote (optional)",
@@ -143,7 +269,8 @@ impl App {
             cursors,
             active: 0,
             create_initial_commit: true,
-            destination_follows_name: true,
+            folder_follows_name: true,
+            directory_picker: None,
             status: None,
             outcome: None,
             quit: false,
@@ -167,8 +294,8 @@ impl App {
 
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-        if area.width < 60 || area.height < 18 {
-            let warning = Paragraph::new("Terminal too small. Resize it to at least 60x18.")
+        if area.width < 60 || area.height < 19 {
+            let warning = Paragraph::new("Terminal too small. Resize it to at least 60x19.")
                 .style(Style::default().fg(Color::Yellow))
                 .block(
                     Block::default()
@@ -184,7 +311,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(11),
+                Constraint::Min(12),
                 Constraint::Length(4),
             ])
             .split(area);
@@ -204,7 +331,14 @@ impl App {
         self.render_form(frame, layout[1]);
 
         let status = self.status.as_ref().map_or_else(
-            || "Tab/Shift+Tab: navigate  Enter: next/create  Ctrl+G: create  Esc: quit".to_string(),
+            || {
+                if self.active == PARENT_DIRECTORY {
+                    "Type a path or press Enter to browse directories. Tab: next".to_string()
+                } else {
+                    "Tab/Shift+Tab: navigate  Enter: next/create  Ctrl+G: create  Esc: quit"
+                        .to_string()
+                }
+            },
             |(message, _)| message.clone(),
         );
         let status_color = self
@@ -222,6 +356,10 @@ impl App {
             )
             .wrap(Wrap { trim: true });
         frame.render_widget(footer, layout[2]);
+
+        if let Some(picker) = &self.directory_picker {
+            self.render_directory_picker(frame, picker);
+        }
     }
 
     fn render_form(&self, frame: &mut Frame, area: Rect) {
@@ -237,7 +375,7 @@ impl App {
             .split(inner);
 
         for (index, field) in self.fields.iter().enumerate() {
-            let active = index == self.active;
+            let active = index == self.active && self.directory_picker.is_none();
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(28), Constraint::Min(1)])
@@ -299,7 +437,81 @@ impl App {
         }
     }
 
+    fn render_directory_picker(&self, frame: &mut Frame, picker: &DirectoryPicker) {
+        let screen = frame.area();
+        let area = Rect {
+            x: screen.x + 4,
+            y: screen.y + 2,
+            width: screen.width.saturating_sub(8),
+            height: screen.height.saturating_sub(4),
+        };
+        frame.render_widget(Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Select parent directory ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(picker.current.display().to_string())
+                .style(Style::default().fg(Color::Cyan))
+                .wrap(Wrap { trim: false }),
+            layout[0],
+        );
+
+        let visible_count = usize::from(layout[1].height);
+        let offset = picker
+            .selected
+            .saturating_sub(visible_count.saturating_sub(1));
+        let lines: Vec<Line<'_>> = picker
+            .entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible_count)
+            .map(|(index, entry)| {
+                let style = if index == picker.selected {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::styled(format!(" {} ", entry.label()), style)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), layout[1]);
+
+        let (help, color) = picker.error.as_ref().map_or(
+            (
+                "↑/↓: navigate  Enter: open/select  Backspace: parent  S: select current  Esc: cancel",
+                Color::DarkGray,
+            ),
+            |error| (error.as_str(), Color::Red),
+        );
+        frame.render_widget(
+            Paragraph::new(help)
+                .style(Style::default().fg(color))
+                .wrap(Wrap { trim: true }),
+            layout[2],
+        );
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.directory_picker.is_some() {
+            self.handle_directory_picker_key(key);
+            return;
+        }
+
         self.status = None;
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -316,7 +528,9 @@ impl App {
             KeyCode::Tab | KeyCode::Down => self.focus_next(),
             KeyCode::BackTab | KeyCode::Up => self.focus_previous(),
             KeyCode::Enter => {
-                if self.active == INITIAL_COMMIT {
+                if self.active == PARENT_DIRECTORY {
+                    self.open_directory_picker();
+                } else if self.active == INITIAL_COMMIT {
                     self.submit();
                 } else {
                     self.focus_next();
@@ -338,6 +552,62 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_directory_picker_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.directory_picker = None,
+            KeyCode::Up => self.directory_picker.as_mut().unwrap().move_up(),
+            KeyCode::Down => self.directory_picker.as_mut().unwrap().move_down(),
+            KeyCode::Home => self.directory_picker.as_mut().unwrap().selected = 0,
+            KeyCode::End => {
+                let picker = self.directory_picker.as_mut().unwrap();
+                picker.selected = picker.entries.len().saturating_sub(1);
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                self.directory_picker.as_mut().unwrap().go_to_parent();
+            }
+            KeyCode::Char('s' | 'S') => {
+                let path = self.directory_picker.as_ref().unwrap().current.clone();
+                self.select_parent_directory(path);
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                let selected = self.directory_picker.as_mut().unwrap().enter_selected();
+                if let Some(path) = selected {
+                    self.select_parent_directory(path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_directory_picker(&mut self) {
+        let entered_path = PathBuf::from(self.fields[PARENT_DIRECTORY].value.trim());
+        let path = if entered_path.is_absolute() {
+            entered_path
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(entered_path)
+        };
+
+        match DirectoryPicker::new(&path) {
+            Ok(picker) => self.directory_picker = Some(picker),
+            Err(error) => self.status = Some((error.to_string(), true)),
+        }
+    }
+
+    fn select_parent_directory(&mut self, path: PathBuf) {
+        self.fields[PARENT_DIRECTORY].value = path.display().to_string();
+        self.cursors[PARENT_DIRECTORY] = self.fields[PARENT_DIRECTORY].value.len();
+        self.directory_picker = None;
+        self.active = FOLDER_NAME;
+        self.status = Some(("Parent directory selected.".into(), false));
     }
 
     fn focus_next(&mut self) {
@@ -394,14 +664,13 @@ impl App {
     }
 
     fn after_edit(&mut self) {
-        if self.active == DESTINATION {
-            self.destination_follows_name = false;
+        if self.active == FOLDER_NAME {
+            self.folder_follows_name = false;
         }
 
-        if self.active == PROJECT_NAME && self.destination_follows_name {
-            let destination = format!("./{}", slugify(&self.fields[PROJECT_NAME].value));
-            self.fields[DESTINATION].value = destination;
-            self.cursors[DESTINATION] = self.fields[DESTINATION].value.len();
+        if self.active == PROJECT_NAME && self.folder_follows_name {
+            self.fields[FOLDER_NAME].value = slugify(&self.fields[PROJECT_NAME].value);
+            self.cursors[FOLDER_NAME] = self.fields[FOLDER_NAME].value.len();
         }
     }
 
@@ -420,13 +689,26 @@ impl App {
 
     fn generate(&self) -> AppResult<GenerationOutcome> {
         let project_name = self.fields[PROJECT_NAME].value.trim();
-        let destination = self.fields[DESTINATION].value.trim();
+        let parent_directory = self.fields[PARENT_DIRECTORY].value.trim();
+        let folder_name = self.fields[FOLDER_NAME].value.trim();
 
         if project_name.is_empty() {
             return Err(input_error("Repository name is required."));
         }
-        if destination.is_empty() {
-            return Err(input_error("Destination is required."));
+        if parent_directory.is_empty() {
+            return Err(input_error("Parent directory is required."));
+        }
+        if folder_name.is_empty() {
+            return Err(input_error("Folder name is required."));
+        }
+        if folder_name == "."
+            || folder_name == ".."
+            || folder_name.contains('/')
+            || folder_name.contains('\\')
+        {
+            return Err(input_error(
+                "Folder name must be a single directory name without path separators.",
+            ));
         }
         if self.fields[REPORT_TITLE].value.trim().is_empty() {
             return Err(input_error("Report title is required."));
@@ -438,7 +720,15 @@ impl App {
             return Err(input_error("Fields cannot contain line breaks."));
         }
 
-        let path = PathBuf::from(destination);
+        let parent = PathBuf::from(parent_directory);
+        if !parent.is_dir() {
+            return Err(input_error(format!(
+                "Parent directory does not exist: {}",
+                parent.display()
+            )));
+        }
+
+        let path = parent.join(folder_name);
         if path.exists() {
             return Err(input_error(format!(
                 "Destination already exists: {}",
@@ -768,13 +1058,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "polytech-latex-git-{}-{unique}",
-            std::process::id()
-        ));
+        let folder_name = format!("polytech-latex-git-{}-{unique}", std::process::id());
+        let path = std::env::temp_dir().join(&folder_name);
         let remote = "git@github.com:example/sample-report.git";
         let mut app = App::new();
-        app.fields[DESTINATION].value = path.to_string_lossy().into_owned();
+        app.fields[PARENT_DIRECTORY].value = std::env::temp_dir().display().to_string();
+        app.fields[FOLDER_NAME].value = folder_name;
         app.fields[GIT_REMOTE].value = remote.into();
         app.create_initial_commit = false;
 
@@ -793,5 +1082,36 @@ mod tests {
         );
 
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn directory_picker_navigates_and_selects_a_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "polytech-latex-picker-{}-{unique}",
+            std::process::id()
+        ));
+        let child = root.join("reports");
+        fs::create_dir_all(&child).unwrap();
+
+        let mut picker = DirectoryPicker::new(&root).unwrap();
+        let child_index = picker
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, PickerEntry::Directory(path) if path == &child))
+            .unwrap();
+        picker.selected = child_index;
+
+        assert!(picker.enter_selected().is_none());
+        assert_eq!(picker.current, fs::canonicalize(&child).unwrap());
+        assert_eq!(
+            picker.enter_selected(),
+            Some(fs::canonicalize(&child).unwrap())
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
